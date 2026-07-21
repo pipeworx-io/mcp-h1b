@@ -1,0 +1,20 @@
+{
+  "name": "@pipeworx/mcp-h1b",
+  "version": "0.1.0",
+  "description": "US H-1B visa sponsorship & LCA wage data — does a company sponsor, and what they pay per role",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "h1b"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipeworx-io/mcp-h1b"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
