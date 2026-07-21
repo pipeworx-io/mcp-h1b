@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-h1b",
-  "version": "0.1.0",
-  "description": "US H-1B visa sponsorship & LCA wage data — does a company sponsor, and what they pay per role",
+  "version": "0.2.0",
+  "description": "US H-1B visa sponsorship, LCA wages & top sponsors by role — recruiting/talent data",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",

@@ -1,6 +1,6 @@
 # mcp-h1b
 
-US H-1B visa sponsorship & LCA wage data — does a company sponsor, and what they pay per role
+US H-1B visa sponsorship, LCA wages & top sponsors by role — recruiting/talent data
 
 Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1339+ live data sources.
 

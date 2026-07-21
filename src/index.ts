@@ -66,6 +66,21 @@ const tools: McpToolExport['tools'] = [
       required: ['job_title'],
     },
   },
+  {
+    name: 'h1b_top_sponsors',
+    description:
+      "Find which US employers sponsor the most H-1B visas for a given job title (optionally in a specific city) — a candidate-sourcing / target-account signal for recruiting. Answers 'which companies sponsor the most data engineers in Austin' or 'top H-1B sponsors for nurses'. Returns employers ranked by certified LCA filings for the role, each with their filing count and median base salary. Backed by real DOL LCA disclosures.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_title: { type: 'string', description: 'Job title to rank sponsors for, e.g. "data engineer", "physical therapist".' },
+        city: { type: 'string', description: 'Optional work city to scope to, e.g. "AUSTIN" or "NEW YORK".' },
+        year: { type: ['number', 'string'], description: 'Filing year (e.g. 2024). Defaults to the most recent full year.' },
+        limit: { type: ['number', 'string'], description: 'Max employers to return (default 15, max 50).' },
+      },
+      required: ['job_title'],
+    },
+  },
 ];
 
 interface LcaRecord {
@@ -205,6 +220,42 @@ async function salary(args: Record<string, unknown>): Promise<unknown> {
   };
 }
 
+async function topSponsors(args: Record<string, unknown>): Promise<unknown> {
+  const job = typeof args.job_title === 'string' ? args.job_title.trim() : '';
+  if (!job) return { error: 'user_error', message: 'Pass a job_title, e.g. {"job_title": "data engineer"}.' };
+  const year = yearArg(args.year);
+  const city = typeof args.city === 'string' ? args.city.trim().toUpperCase() : undefined;
+  const limit = Math.min(Math.max(Number(args.limit) || 15, 1), 50);
+  const recs = (await fetchLca({ job, city, year })).filter((r) => r.job_title.toLowerCase().includes(job.toLowerCase()));
+  if (recs.length === 0) {
+    return { job_title: job, year, city: city ?? null, count: 0, message: 'No H-1B sponsors matched. Try a broader title, a different year, or removing the city filter.' };
+  }
+  // Group by employer → count + median salary.
+  const byEmployer = new Map<string, number[]>();
+  for (const r of recs) {
+    const list = byEmployer.get(r.employer) ?? [];
+    if (r.base_salary != null) list.push(r.base_salary);
+    byEmployer.set(r.employer, list);
+  }
+  const counts = new Map<string, number>();
+  for (const r of recs) counts.set(r.employer, (counts.get(r.employer) ?? 0) + 1);
+  const sponsors = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([employer, filings]) => {
+      const sals = (byEmployer.get(employer) ?? []).sort((a, b) => a - b);
+      return { employer, lca_filings: filings, median_base_salary: sals.length ? sals[Math.floor(sals.length / 2)] : null };
+    });
+  return {
+    job_title: job,
+    year,
+    city: city ?? null,
+    total_filings: recs.length,
+    top_sponsors: sponsors,
+    note: 'Employers ranked by certified H-1B LCA filings for this role — a sourcing/target-account signal. Source: DOL LCA disclosures.',
+  };
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   try {
     switch (name) {
@@ -212,6 +263,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         return await employerSponsorship(args);
       case 'h1b_salary':
         return await salary(args);
+      case 'h1b_top_sponsors':
+        return await topSponsors(args);
       default:
         return { error: `Unknown tool: ${name}` };
     }
