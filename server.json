@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/h1b",
   "title": "H1b",
-  "description": "US H-1B visa sponsorship, LCA wages & top sponsors by role — recruiting/talent data",
-  "version": "0.2.0",
+  "description": "H-1B MCP — US H-1B visa sponsorship & wage data from DOL Labor Condition",
+  "version": "0.2.1",
   "websiteUrl": "https://pipeworx.io/packs/h1b",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-h1b",

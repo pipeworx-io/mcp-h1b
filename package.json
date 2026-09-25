@@ -1,20 +1,32 @@
 {
   "name": "@pipeworx/mcp-h1b",
-  "version": "0.2.0",
-  "description": "US H-1B visa sponsorship, LCA wages & top sponsors by role — recruiting/talent data",
+  "version": "0.2.1",
+  "description": "H-1B MCP — US H-1B visa sponsorship & wage data from DOL Labor Condition",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "mcp-h1b": "bin/cli.js"
+  },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "h1b"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipeworx-io/mcp-h1b"
+    "url": "git+https://github.com/pipeworx-io/mcp-h1b.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-3268a9ed916036d4d0e8817b435aa3dc850ef60daf2b125b982771da8410b89b",
+    "sourceCommit": "76aa8f5d9b5dc2f665563030647c68e661478864"
   }
 }
