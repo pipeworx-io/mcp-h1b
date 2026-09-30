@@ -672,18 +672,51 @@ function collapse(s: string): string {
 }
 /**
  * H-1B MCP — US H-1B visa sponsorship & wage data from DOL Labor Condition
- * Application (LCA) disclosures, keyless.
+ * Application (LCA) disclosures.
  *
  * Recruiting/talent use: "does company X sponsor H-1B?", "what does company X
  * pay for role Y?", "what are the H-1B wage ranges for a software engineer in
  * Seattle?". Each LCA record is a real, disclosed employer + job title + base
  * salary + work location + filing dates.
  *
- * Source: h1bdata.info, which aggregates the DOL FLAG LCA disclosure files into
- * a searchable table (query params em=employer, job=title, city, year). We fetch
- * and AGGREGATE the rows into the summaries recruiters actually need rather than
- * dumping raw records. If this third-party ever breaks, the authoritative
- * fallback is the DOL FLAG bulk disclosure data at flag.dol.gov (host-and-index).
+ * SOURCE, TWO TIERS (fleet #2514). Primary: a Pipeworx-maintained local
+ * mirror of DOL's own LCA disclosure files (dol.gov/agencies/eta/foreign-
+ * labor/performance) — loaded by scripts/h1b-lca-upsert.sh /
+ * .github/workflows/h1b-lca-refresh.yml into Supabase h1b_lca_disclosures,
+ * schema + RPCs in supabase/migrations/222_h1b_lca_disclosures.sql. This
+ * pack used to scrape h1bdata.info exclusively; that scrape capped at 20,000
+ * HTML table rows per query (see fetchLcaLive below) so a large employer's
+ * salary stats were silently computed from a truncated, non-representative
+ * slice with nothing telling the caller. The local mirror has no such cap.
+ *
+ * Fallback: h1bdata.info, a third-party aggregator of the same DOL data,
+ * used ONLY when the requested fiscal_year falls outside the local mirror's
+ * currently loaded window (checked via h1b_lca_coverage() every call — the
+ * mirror is loaded incrementally, not the full DOL archive back to 2001) or
+ * when the DB is unreachable. Every response says which source actually
+ * answered it (`source` field) — this pack never silently swaps sources.
+ *
+ * FISCAL YEAR, NOT CALENDAR YEAR, for the local mirror. DOL's own files are
+ * organized by FEDERAL fiscal year (Oct 1 - Sep 30); `year` here is passed
+ * straight through as that fiscal year. h1bdata.info's "year" filter is a
+ * DIFFERENT, unverified semantic (most likely calendar year of filing) — a
+ * query answered by the live fallback for the same `year` value is not
+ * guaranteed to mean the identical 12-month window as one answered locally.
+ * The response's `note`/`source` fields say which happened.
+ *
+ * NO PERSONAL DATA IN THE MIRROR (local-copy rule, task #2514). DOL's own
+ * record layout (read in full 2026-09-29) carries named-individual contact
+ * fields — the employer's point-of-contact name/email/phone, the
+ * representing attorney/agent's name/email/phone, and the form preparer's
+ * name/email. None of those are loaded; see the migration header for the
+ * full column-by-column accounting. DOL's file already excludes the foreign
+ * worker's own name/address — no worker PII was ever in this dataset.
+ *
+ * `data_as_of` is on every locally-served response (the local mirror's last
+ * successful refresh, via h1b_lca_coverage()).
+ *
+ * Tools: h1b_employer_sponsorship, h1b_salary, h1b_top_sponsors (unchanged
+ * names/arguments — only where the answer comes from changed).
  */
 
 
@@ -695,19 +728,20 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
   return fetchWithTimeout(url, init ?? {}, 'H-1B');
 }
 
-const BASE = 'https://h1bdata.info/index.php';
+const LIVE_BASE = 'https://h1bdata.info/index.php';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const DB_QUERY_TIMEOUT_MS = 9000; // PostgREST's authenticated-role statement_timeout is 8s; just past it so a slow query surfaces as our message, not a bare abort.
 
 const tools: McpToolExport['tools'] = [
   {
     name: 'h1b_employer_sponsorship',
     description:
-      "Check whether a US employer sponsors H-1B visas and profile their sponsorship, from DOL Labor Condition Application (LCA) disclosures. Answers 'does company X sponsor H-1B / green cards' for recruiting and candidate advising. Returns the number of certified LCA filings, base-salary range (min / median / max), the top sponsored job titles, and top work locations for the employer. Filter by year (defaults to the latest full year). Employer name is matched as the disclosed legal name (e.g. 'Google', 'Amazon.com Services').",
+      "Check whether a US employer sponsors H-1B visas and profile their sponsorship, from DOL Labor Condition Application (LCA) disclosures. Answers 'does company X sponsor H-1B / green cards' for recruiting and candidate advising. Returns the number of certified LCA filings, base-salary range (min / median / max), the top sponsored job titles, and top work locations for the employer. Filter by year (DOL federal fiscal year, Oct-Sep, for recent years); defaults to the latest full year. Employer name is matched as the disclosed legal name (e.g. 'Google', 'Amazon.com Services').",
     inputSchema: {
       type: 'object',
       properties: {
         employer: { type: 'string', description: 'Employer name to look up, e.g. "Google", "Deloitte", "Amazon".' },
-        year: { type: ['number', 'string'], description: 'Filing year (e.g. 2024). Defaults to the most recent full year.' },
+        year: { type: ['number', 'string'], description: 'Filing year (e.g. 2024). Defaults to the most recent full year. Interpreted as DOL federal fiscal year (Oct-Sep) for recent years.' },
       },
       required: ['employer'],
     },
@@ -754,26 +788,178 @@ interface LcaRecord {
   start_date: string;
 }
 
+interface Coverage {
+  min_fiscal_year: number | null;
+  max_fiscal_year: number | null;
+  total_rows: number;
+  data_as_of: string | null;
+}
+
 function defaultYear(): number {
-  // h1bdata is organized by filing year; the latest full year lags ~1 year.
-  // Deterministic (Date.now is available in workers) but bounded to avoid a
-  // future year with no data.
+  // The latest full (federal fiscal or calendar) year lags ~1 year behind
+  // "now". Deterministic (Date.now is available in workers) but bounded to
+  // avoid a future year with no data.
   const y = new Date().getUTCFullYear();
   return y - 1;
 }
+
+function yearArg(v: unknown): number {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 2001 && n <= 2100 ? n : defaultYear();
+}
+
+// ── Local DOL mirror (primary) ──────────────────────────────────────────
+
+async function dbRpc<T>(
+  supabaseUrl: string | undefined,
+  supabaseKey: string | undefined,
+  fn: string,
+  body: Record<string, unknown>,
+): Promise<T[] | null> {
+  if (!supabaseUrl || !supabaseKey) return null; // not injected -> caller falls back to the live scrape
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), DB_QUERY_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${supabaseUrl}/rest/v1/rpc/${fn}`, {
+      method: 'POST',
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    // Any non-2xx (including an empty/not-yet-migrated table before the
+    // first load runs) falls through to the live scrape rather than
+    // erroring the whole tool call — this pack must never regress below
+    // its pre-#2514 behavior while the mirror is still being backfilled.
+    if (!res.ok) return null;
+    return (await res.json()) as T[];
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getCoverage(supabaseUrl: string | undefined, supabaseKey: string | undefined): Promise<Coverage | null> {
+  const rows = await dbRpc<Coverage>(supabaseUrl, supabaseKey, 'h1b_lca_coverage', {});
+  const row = rows?.[0];
+  if (!row || row.total_rows === 0) return null;
+  return row;
+}
+
+function yearInCoverage(year: number, coverage: Coverage | null): boolean {
+  if (!coverage || coverage.min_fiscal_year == null || coverage.max_fiscal_year == null) return false;
+  return year >= coverage.min_fiscal_year && year <= coverage.max_fiscal_year;
+}
+
+interface DbLcaRow {
+  employer_name: string;
+  job_title: string;
+  base_salary_annual: number | null;
+  worksite_city: string | null;
+  worksite_state: string | null;
+  received_date: string | null;
+  begin_date: string | null;
+}
+
+async function fetchLcaFromDb(
+  supabaseUrl: string | undefined,
+  supabaseKey: string | undefined,
+  params: { em?: string; job?: string; city?: string; year: number },
+): Promise<LcaRecord[] | null> {
+  const rows = await dbRpc<DbLcaRow>(supabaseUrl, supabaseKey, 'h1b_lca_search', {
+    p_employer: params.em || null,
+    p_job_title: params.job || null,
+    p_worksite_city: params.city || null,
+    p_fiscal_year: params.year,
+    p_limit: 20000,
+    p_any_status: false,
+  });
+  if (rows === null) return null;
+  return rows.map((r) => ({
+    employer: r.employer_name,
+    job_title: r.job_title,
+    base_salary: r.base_salary_annual,
+    location: [r.worksite_city, r.worksite_state].filter(Boolean).join(', '),
+    submit_date: r.received_date ?? '',
+    start_date: r.begin_date ?? '',
+  }));
+}
+
+interface DbStatsRow {
+  lca_filings: number;
+  with_salary: number;
+  min_salary: number | null;
+  median_salary: number | null;
+  avg_salary: number | null;
+  max_salary: number | null;
+  top_job_titles: { value: string; count: number }[];
+  top_locations: { value: string; count: number }[];
+  top_employers: { value: string; count: number }[];
+}
+
+// Aggregate stats over ALL matching rows, computed server-side in one
+// function call (migration 223) — replaces fetching row-level records via
+// h1b_lca_search and counting/aggregating them in JS, which is exactly the
+// shape Supabase's db-max-rows=1000 cap silently truncates: any employer
+// with more than 1000 matching LCA filings (e.g. Google, ~7,448 certified
+// rows) came back as a clean 200 with lca_filings capped at 1000 and no
+// signal that anything was cut (verified live 2026-09-30). h1b_top_sponsors
+// was never affected by this because it GROUPs before returning; this gives
+// h1b_employer_sponsorship and h1b_salary the same shape.
+async function fetchStatsFromDb(
+  supabaseUrl: string | undefined,
+  supabaseKey: string | undefined,
+  params: { em?: string; job?: string; city?: string; year: number; topN?: number },
+): Promise<DbStatsRow | null> {
+  const rows = await dbRpc<DbStatsRow>(supabaseUrl, supabaseKey, 'h1b_lca_stats', {
+    p_employer: params.em || null,
+    p_job_title: params.job || null,
+    p_worksite_city: params.city || null,
+    p_fiscal_year: params.year,
+    p_any_status: false,
+    p_top_n: params.topN ?? 10,
+  });
+  return rows?.[0] ?? null;
+}
+
+interface DbTopSponsorRow {
+  employer_name: string;
+  lca_filings: number;
+  median_base_salary: number | null;
+  total_all_filings: number;
+}
+
+async function fetchTopSponsorsFromDb(
+  supabaseUrl: string | undefined,
+  supabaseKey: string | undefined,
+  params: { job: string; city?: string; year: number; limit: number },
+): Promise<DbTopSponsorRow[] | null> {
+  return dbRpc<DbTopSponsorRow>(supabaseUrl, supabaseKey, 'h1b_top_sponsors', {
+    p_job_title: params.job,
+    p_worksite_city: params.city || null,
+    p_fiscal_year: params.year,
+    p_limit: params.limit,
+  });
+}
+
+// ── h1bdata.info (fallback, used only outside the local mirror's loaded window) ──
 
 function stripTags(s: string): string {
   return s.replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&#0?39;/g, "'").replace(/\s+/g, ' ').trim();
 }
 
-async function fetchLca(params: { em?: string; job?: string; city?: string; year: number }): Promise<LcaRecord[]> {
+async function fetchLcaLive(params: { em?: string; job?: string; city?: string; year: number }): Promise<LcaRecord[]> {
   const qs = new URLSearchParams({
     em: params.em ?? '',
     job: params.job ?? '',
     city: params.city ?? '',
     year: String(params.year),
   });
-  const res = await pwFetch(`${BASE}?${qs}`, { headers: { 'User-Agent': UA, Accept: 'text/html' } });
+  const res = await pwFetch(`${LIVE_BASE}?${qs}`, { headers: { 'User-Agent': UA, Accept: 'text/html' } });
   if (!res.ok) throw await httpError(res, 'upstream_down: h1bdata');
   // Strip ad injections (ezoic/adsense) that get inlined into table cells —
   // otherwise "(adsbygoogle = ...)" leaks into employer/title text.
@@ -794,10 +980,12 @@ async function fetchLca(params: { em?: string; job?: string; city?: string; year
       submit_date: stripTags(m[5]),
       start_date: stripTags(m[6]),
     });
-    if (records.length >= 20000) break; // safety cap on huge employers
+    if (records.length >= 20000) break; // safety cap on huge employers — this is the truncation the local mirror exists to remove
   }
   return records;
 }
+
+// ── shared stats (source-agnostic — same LcaRecord[] shape from either path) ──
 
 function salaryStats(recs: LcaRecord[]) {
   const sals = recs.map((r) => r.base_salary).filter((n): n is number => n != null).sort((a, b) => a - b);
@@ -822,39 +1010,76 @@ function topN(recs: LcaRecord[], key: 'job_title' | 'location' | 'employer', n: 
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([value, count]) => ({ value, count }));
 }
 
-function yearArg(v: unknown): number {
-  const n = Number(v);
-  return Number.isInteger(n) && n >= 2001 && n <= 2100 ? n : defaultYear();
-}
+// ── tools ────────────────────────────────────────────────────────────────
 
-async function employerSponsorship(args: Record<string, unknown>): Promise<unknown> {
+async function employerSponsorship(supabaseUrl: string | undefined, supabaseKey: string | undefined, args: Record<string, unknown>): Promise<unknown> {
   const employer = typeof args.employer === 'string' ? args.employer.trim() : '';
   if (!employer) return { error: 'user_error', message: 'Pass an employer name, e.g. {"employer": "Google"}.' };
   const year = yearArg(args.year);
-  const recs = await fetchLca({ em: employer, year });
-  if (recs.length === 0) {
+
+  const coverage = await getCoverage(supabaseUrl, supabaseKey);
+  const useDb = yearInCoverage(year, coverage);
+  const stats = useDb ? await fetchStatsFromDb(supabaseUrl, supabaseKey, { em: employer, year, topN: 10 }) : null;
+
+  if (stats !== null) {
+    // Aggregated server-side over EVERY matching row (migration 223) — never
+    // a truncated sample, however large the employer.
+    if (stats.lca_filings === 0) {
+      return {
+        employer,
+        year,
+        sponsors_h1b: false,
+        source: 'dol_lca_disclosures',
+        data_as_of: coverage?.data_as_of ?? null,
+        message: `No certified H-1B LCA filings found for an employer matching "${employer}" in ${year}. They may not sponsor, may file under a different legal name, or had no filings that year (try another year).`,
+      };
+    }
+    return {
+      employer,
+      year,
+      sponsors_h1b: true,
+      source: 'dol_lca_disclosures',
+      data_as_of: coverage?.data_as_of ?? null,
+      lca_filings: stats.lca_filings,
+      matched_employers: stats.top_employers.map((e) => e.value),
+      base_salary_usd: { min: stats.min_salary, median: stats.median_salary, average: stats.avg_salary, max: stats.max_salary },
+      top_job_titles: stats.top_job_titles,
+      top_locations: stats.top_locations,
+      note: `Certified LCA filings ≈ the employer intends to sponsor for these roles; actual visa grants differ. Source: DOL LCA disclosures (federal fiscal year ${year}, Oct-Sep). Aggregated over every matching filing, not a truncated sample.`,
+    };
+  }
+
+  // Fallback: local mirror unavailable (year outside its loaded window, DB
+  // unreachable, or migration 223 not yet applied) — live scrape, unchanged
+  // from pre-#2514 behavior (including its own 20,000-row cap).
+  const finalRecs = await fetchLcaLive({ em: employer, year });
+  if (finalRecs.length === 0) {
     return {
       employer,
       year,
       sponsors_h1b: false,
+      source: 'h1bdata.info (live)',
+      data_as_of: null,
       message: `No certified H-1B LCA filings found for an employer matching "${employer}" in ${year}. They may not sponsor, may file under a different legal name, or had no filings that year (try another year).`,
     };
   }
-  const stats = salaryStats(recs);
+  const liveStats = salaryStats(finalRecs);
   return {
     employer,
     year,
     sponsors_h1b: true,
-    lca_filings: recs.length,
-    matched_employers: topN(recs, 'employer', 5).map((e) => e.value),
-    base_salary_usd: { min: stats.min, median: stats.median, average: stats.average, max: stats.max },
-    top_job_titles: topN(recs, 'job_title', 10),
-    top_locations: topN(recs, 'location', 10),
-    note: 'Certified LCA filings ≈ the employer intends to sponsor for these roles; actual visa grants differ. Source: DOL LCA disclosures via h1bdata.info.',
+    source: 'h1bdata.info (live)',
+    data_as_of: null,
+    lca_filings: finalRecs.length,
+    matched_employers: topN(finalRecs, 'employer', 5).map((e) => e.value),
+    base_salary_usd: { min: liveStats.min, median: liveStats.median, average: liveStats.average, max: liveStats.max },
+    top_job_titles: topN(finalRecs, 'job_title', 10),
+    top_locations: topN(finalRecs, 'location', 10),
+    note: `Certified LCA filings ≈ the employer intends to sponsor for these roles; actual visa grants differ. Source: DOL LCA disclosures via h1bdata.info (year ${year}).`,
   };
 }
 
-async function salary(args: Record<string, unknown>): Promise<unknown> {
+async function salary(supabaseUrl: string | undefined, supabaseKey: string | undefined, args: Record<string, unknown>): Promise<unknown> {
   const job = typeof args.job_title === 'string' ? args.job_title.trim() : '';
   if (!job) return { error: 'user_error', message: 'Pass a job_title, e.g. {"job_title": "software engineer"}.' };
   const year = yearArg(args.year);
@@ -862,37 +1087,118 @@ async function salary(args: Record<string, unknown>): Promise<unknown> {
   const city = typeof args.city === 'string' ? args.city.trim().toUpperCase() : undefined;
   const limit = Math.min(Math.max(Number(args.limit) || 15, 1), 50);
 
-  // h1bdata's job filter is exact-ish; fetch by employer+year (or job+year) and
-  // filter the title substring client-side for flexible matching.
-  const recs = (await fetchLca({ em: employer, job: employer ? undefined : job, city, year })).filter((r) =>
+  const coverage = await getCoverage(supabaseUrl, supabaseKey);
+  const useDb = yearInCoverage(year, coverage);
+  // Stats aggregated over EVERY matching row server-side (migration 223) —
+  // both employer AND job_title applied together in SQL, unlike the old
+  // row-level path this replaces (which fetched by employer alone and
+  // filtered job_title client-side, after truncation to whatever the RPC's
+  // row cap let through).
+  const stats = useDb ? await fetchStatsFromDb(supabaseUrl, supabaseKey, { em: employer, job, city, year }) : null;
+
+  if (stats !== null) {
+    if (stats.lca_filings === 0) {
+      return {
+        job_title: job,
+        year,
+        employer: employer ?? null,
+        city: city ?? null,
+        source: 'dol_lca_disclosures',
+        data_as_of: coverage?.data_as_of ?? null,
+        count: 0,
+        message: 'No H-1B salary records matched. Try a broader title, a different year, or removing the employer/city filter.',
+      };
+    }
+    // Small, explicitly bounded sample (max 50) — far under the 1000-row
+    // cap, so unlike the stats above it is safe to fetch via h1b_lca_search.
+    const sampleRecs = (await fetchLcaFromDb(supabaseUrl, supabaseKey, { em: employer, job, city, year })) ?? [];
+    return {
+      job_title: job,
+      year,
+      employer: employer ?? null,
+      city: city ?? null,
+      source: 'dol_lca_disclosures',
+      data_as_of: coverage?.data_as_of ?? null,
+      base_salary_usd: { count: stats.with_salary, min: stats.min_salary, median: stats.median_salary, average: stats.avg_salary, max: stats.max_salary },
+      sample: sampleRecs.slice(0, limit).map((r) => ({ employer: r.employer, title: r.job_title, base_salary: r.base_salary, location: r.location, start_date: r.start_date })),
+      note: `Real disclosed base salaries from DOL LCA filings (federal fiscal year ${year}) — a market wage benchmark. Aggregated over every matching filing (${stats.lca_filings} total), not a truncated sample.`,
+    };
+  }
+
+  // Fallback: local mirror unavailable — live scrape, unchanged from
+  // pre-#2514 behavior.
+  const recs = (await fetchLcaLive({ em: employer, job: employer ? undefined : job, city, year })).filter((r) =>
     r.job_title.toLowerCase().includes(job.toLowerCase()),
   );
+
   if (recs.length === 0) {
-    return { job_title: job, year, employer: employer ?? null, city: city ?? null, count: 0, message: 'No H-1B salary records matched. Try a broader title, a different year, or removing the employer/city filter.' };
+    return {
+      job_title: job,
+      year,
+      employer: employer ?? null,
+      city: city ?? null,
+      source: 'h1bdata.info (live)',
+      data_as_of: null,
+      count: 0,
+      message: 'No H-1B salary records matched. Try a broader title, a different year, or removing the employer/city filter.',
+    };
   }
-  const stats = salaryStats(recs);
+  const liveStats = salaryStats(recs);
   return {
     job_title: job,
     year,
     employer: employer ?? null,
     city: city ?? null,
-    base_salary_usd: { count: stats.with_salary, min: stats.min, median: stats.median, average: stats.average, max: stats.max },
+    source: 'h1bdata.info (live)',
+    data_as_of: null,
+    base_salary_usd: { count: liveStats.with_salary, min: liveStats.min, median: liveStats.median, average: liveStats.average, max: liveStats.max },
     sample: recs.slice(0, limit).map((r) => ({ employer: r.employer, title: r.job_title, base_salary: r.base_salary, location: r.location, start_date: r.start_date })),
-    note: 'Real disclosed base salaries from DOL H-1B LCA filings — a market wage benchmark. Source: h1bdata.info.',
+    note: `Real disclosed base salaries from DOL H-1B LCA filings — a market wage benchmark. Source: h1bdata.info (year ${year}).`,
   };
 }
 
-async function topSponsors(args: Record<string, unknown>): Promise<unknown> {
+async function topSponsors(supabaseUrl: string | undefined, supabaseKey: string | undefined, args: Record<string, unknown>): Promise<unknown> {
   const job = typeof args.job_title === 'string' ? args.job_title.trim() : '';
   if (!job) return { error: 'user_error', message: 'Pass a job_title, e.g. {"job_title": "data engineer"}.' };
   const year = yearArg(args.year);
   const city = typeof args.city === 'string' ? args.city.trim().toUpperCase() : undefined;
   const limit = Math.min(Math.max(Number(args.limit) || 15, 1), 50);
-  const recs = (await fetchLca({ job, city, year })).filter((r) => r.job_title.toLowerCase().includes(job.toLowerCase()));
-  if (recs.length === 0) {
-    return { job_title: job, year, city: city ?? null, count: 0, message: 'No H-1B sponsors matched. Try a broader title, a different year, or removing the city filter.' };
+
+  const coverage = await getCoverage(supabaseUrl, supabaseKey);
+  const useDb = yearInCoverage(year, coverage);
+
+  if (useDb) {
+    const dbSponsors = await fetchTopSponsorsFromDb(supabaseUrl, supabaseKey, { job, city, year, limit });
+    if (dbSponsors !== null) {
+      if (dbSponsors.length === 0) {
+        return {
+          job_title: job,
+          year,
+          city: city ?? null,
+          source: 'dol_lca_disclosures',
+          data_as_of: coverage?.data_as_of ?? null,
+          count: 0,
+          message: 'No H-1B sponsors matched. Try a broader title, a different year, or removing the city filter.',
+        };
+      }
+      return {
+        job_title: job,
+        year,
+        city: city ?? null,
+        source: 'dol_lca_disclosures',
+        data_as_of: coverage?.data_as_of ?? null,
+        total_filings: dbSponsors[0].total_all_filings,
+        top_sponsors: dbSponsors.map((s) => ({ employer: s.employer_name, lca_filings: s.lca_filings, median_base_salary: s.median_base_salary })),
+        note: `Employers ranked by certified H-1B LCA filings for this role — a sourcing/target-account signal. Source: DOL LCA disclosures (federal fiscal year ${year}). Ranked over ALL matching filings, not a truncated sample.`,
+      };
+    }
   }
-  // Group by employer → count + median salary.
+
+  // Fallback: live scrape, grouped client-side (unchanged from pre-#2514 behavior).
+  const recs = (await fetchLcaLive({ job, city, year })).filter((r) => r.job_title.toLowerCase().includes(job.toLowerCase()));
+  if (recs.length === 0) {
+    return { job_title: job, year, city: city ?? null, source: 'h1bdata.info (live)', count: 0, message: 'No H-1B sponsors matched. Try a broader title, a different year, or removing the city filter.' };
+  }
   const byEmployer = new Map<string, number[]>();
   for (const r of recs) {
     const list = byEmployer.get(r.employer) ?? [];
@@ -912,21 +1218,24 @@ async function topSponsors(args: Record<string, unknown>): Promise<unknown> {
     job_title: job,
     year,
     city: city ?? null,
+    source: 'h1bdata.info (live)',
     total_filings: recs.length,
     top_sponsors: sponsors,
-    note: 'Employers ranked by certified H-1B LCA filings for this role — a sourcing/target-account signal. Source: DOL LCA disclosures.',
+    note: `Employers ranked by certified H-1B LCA filings for this role — a sourcing/target-account signal. Source: DOL LCA disclosures via h1bdata.info (year ${year}; total_filings is capped at 20,000 raw rows).`,
   };
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  const supabaseUrl = args._supabaseUrl as string | undefined;
+  const supabaseKey = args._supabaseKey as string | undefined;
   try {
     switch (name) {
       case 'h1b_employer_sponsorship':
-        return await employerSponsorship(args);
+        return await employerSponsorship(supabaseUrl, supabaseKey, args);
       case 'h1b_salary':
-        return await salary(args);
+        return await salary(supabaseUrl, supabaseKey, args);
       case 'h1b_top_sponsors':
-        return await topSponsors(args);
+        return await topSponsors(supabaseUrl, supabaseKey, args);
       default:
         return { error: `Unknown tool: ${name}` };
     }

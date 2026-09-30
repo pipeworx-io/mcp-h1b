@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-h1b",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "H-1B MCP — US H-1B visa sponsorship & wage data from DOL Labor Condition",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-9ce0521f815cfdcef58d26d5f758752fbe8134bdde2e6636847ef6c528958d5e",
-    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
+    "sourceHash": "v1-797c0484ac28a895d631dc589e9222b2252f9c9d92a45476b0a7e9c65a06a146",
+    "sourceCommit": "658bedc4e66c6eab7e17c569f81012a2ee312624"
   }
 }
