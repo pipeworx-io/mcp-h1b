@@ -4,7 +4,7 @@ US H-1B visa sponsorship and wage data from DOL Labor Condition Application
 (LCA) disclosures — "does company X sponsor H-1B", "what does role Y pay at
 company X", "who sponsors the most data engineers in Austin".
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1686+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -30,6 +30,21 @@ window, or the DB is unreachable — this pack must never regress below its
 pre-#2514 behavior while the mirror is partially backfilled. Every response
 carries a `source` field saying which one actually answered it; the pack
 never silently swaps sources without saying so.
+
+**A fallback zero is never presented as a confident "no" (fleet #3198).**
+If the DB read itself failed this call (no credentials, a timeout, or a
+transient error — `source_status: "primary_unreachable"`), a zero-row
+h1bdata.info answer returns `sponsors_h1b: null` and a message saying the
+primary source was never actually consulted, not disproven. Only when the
+primary source answered fine but the year is genuinely outside its loaded
+window (`source_status: "out_of_window"`) does a fallback zero stand as a
+real (if third-party, lag/rename-prone) "no". `dbRpc` retries once
+immediately on a transient failure before falling back at all, so a single
+network blip doesn't by itself demote a mirror-covered query to the weaker
+source. `h1b_employer_sponsorship`'s `matched_employers` is also now ranked
+exact-match first (then name-contains variants), each tagged `name_match`,
+since the employer-name match is a plain substring and can legitimately
+pull back more than one distinct legal name.
 
 **Why a mirror at all**: the live h1bdata.info scrape caps at 20,000 raw
 HTML table rows per query (`fetchLcaLive`'s safety cap) — for any employer
@@ -206,7 +221,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1686+ data sources. The
+Both URLs reach the same gateway and the same 1819+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

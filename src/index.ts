@@ -810,13 +810,24 @@ function yearArg(v: unknown): number {
 
 // ── Local DOL mirror (primary) ──────────────────────────────────────────
 
-async function dbRpc<T>(
-  supabaseUrl: string | undefined,
-  supabaseKey: string | undefined,
+// Fleet #3198: dbRpc used to collapse "no credentials", "Supabase
+// unreachable/timed out" and "genuinely empty table" into one bare `null`,
+// so every caller treated a transient DB hiccup identically to a deliberate
+// "fall back, the mirror legitimately has nothing here" — and the fallback
+// then presented h1bdata.info's zero as a confident "sponsors_h1b: false"
+// with no hint the mirror (which actually HAD 237 rows for the same query
+// a run earlier) was never consulted. The reason now travels with the
+// result so callers can tell "the mirror doesn't cover this" from "we
+// couldn't read the mirror this time" — those deserve different wording,
+// not the same silent zero.
+type DbOutcome<T> = { ok: true; data: T[] } | { ok: false; reason: 'no_creds' | 'unreachable' };
+
+async function dbRpcOnce<T>(
+  supabaseUrl: string,
+  supabaseKey: string,
   fn: string,
   body: Record<string, unknown>,
-): Promise<T[] | null> {
-  if (!supabaseUrl || !supabaseKey) return null; // not injected -> caller falls back to the live scrape
+): Promise<DbOutcome<T>> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DB_QUERY_TIMEOUT_MS);
   try {
@@ -830,29 +841,117 @@ async function dbRpc<T>(
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
-    // Any non-2xx (including an empty/not-yet-migrated table before the
-    // first load runs) falls through to the live scrape rather than
-    // erroring the whole tool call — this pack must never regress below
-    // its pre-#2514 behavior while the mirror is still being backfilled.
-    if (!res.ok) return null;
-    return (await res.json()) as T[];
+    // A non-2xx here also covers an empty/not-yet-migrated table before the
+    // first load runs — still reported as 'unreachable' (never a silent
+    // success-with-nothing) so a genuinely-empty coverage table and a
+    // genuinely-down DB are not confused with each other upstream either.
+    if (!res.ok) return { ok: false, reason: 'unreachable' };
+    return { ok: true, data: (await res.json()) as T[] };
   } catch {
-    return null;
+    return { ok: false, reason: 'unreachable' };
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function getCoverage(supabaseUrl: string | undefined, supabaseKey: string | undefined): Promise<Coverage | null> {
-  const rows = await dbRpc<Coverage>(supabaseUrl, supabaseKey, 'h1b_lca_coverage', {});
-  const row = rows?.[0];
-  if (!row || row.total_rows === 0) return null;
-  return row;
+// One immediate retry on a transient failure only (never on a clean non-DB
+// case, never on success) — a single network blip or a slow query that just
+// missed the timeout should not alone be enough to push a mirror-covered
+// query onto the weaker third-party fallback.
+async function dbRpc<T>(
+  supabaseUrl: string | undefined,
+  supabaseKey: string | undefined,
+  fn: string,
+  body: Record<string, unknown>,
+): Promise<DbOutcome<T>> {
+  if (!supabaseUrl || !supabaseKey) return { ok: false, reason: 'no_creds' };
+  const first = await dbRpcOnce<T>(supabaseUrl, supabaseKey, fn, body);
+  if (first.ok) return first;
+  return dbRpcOnce<T>(supabaseUrl, supabaseKey, fn, body);
+}
+
+interface CoverageResult {
+  coverage: Coverage | null;
+  /** 'ok' = read the mirror's coverage successfully (even if it's empty). */
+  reason: 'ok' | 'no_creds' | 'unreachable' | 'empty';
+}
+
+async function getCoverage(supabaseUrl: string | undefined, supabaseKey: string | undefined): Promise<CoverageResult> {
+  const result = await dbRpc<Coverage>(supabaseUrl, supabaseKey, 'h1b_lca_coverage', {});
+  if (!result.ok) return { coverage: null, reason: result.reason };
+  const row = result.data[0];
+  if (!row || row.total_rows === 0) return { coverage: null, reason: 'empty' };
+  return { coverage: row, reason: 'ok' };
 }
 
 function yearInCoverage(year: number, coverage: Coverage | null): boolean {
   if (!coverage || coverage.min_fiscal_year == null || coverage.max_fiscal_year == null) return false;
   return year >= coverage.min_fiscal_year && year <= coverage.max_fiscal_year;
+}
+
+/**
+ * Fleet #3198. Decides, ONCE per call, whether the local DOL mirror should
+ * answer and — when it should not — WHY, so every tool function below can
+ * give the fallback's answer the right amount of confidence instead of
+ * treating every non-mirror answer alike:
+ *   useDb              — year is inside the mirror's loaded window and the
+ *                         coverage read itself succeeded; query it.
+ *   'out_of_window'     — the mirror was read fine; this year is just not
+ *                         loaded yet. A fallback zero here is a real (if
+ *                         third-party, lag/rename-prone) signal.
+ *   'mirror_unreachable' — no credentials, a timed-out/failed request, or an
+ *                         empty-looking coverage read. A fallback zero here
+ *                         is NOT evidence of non-sponsorship — the
+ *                         authoritative source was simply never consulted.
+ */
+// Caller-facing status/label values below say "primary source", never
+// "mirror" (see check:hosting-claims — a caller doesn't need the internal
+// architecture, just whether the answer is trustworthy). Comments elsewhere
+// in this file are maintainer-facing and keep using "mirror" freely.
+type MirrorFallbackReason = 'out_of_window' | 'primary_unreachable';
+interface MirrorResolution {
+  coverage: Coverage | null;
+  useDb: boolean;
+  fallbackReason: MirrorFallbackReason | null;
+}
+
+async function resolveMirror(
+  supabaseUrl: string | undefined,
+  supabaseKey: string | undefined,
+  year: number,
+): Promise<MirrorResolution> {
+  const covResult = await getCoverage(supabaseUrl, supabaseKey);
+  if (covResult.reason === 'ok' && covResult.coverage) {
+    if (yearInCoverage(year, covResult.coverage)) return { coverage: covResult.coverage, useDb: true, fallbackReason: null };
+    return { coverage: covResult.coverage, useDb: false, fallbackReason: 'out_of_window' };
+  }
+  // 'no_creds' | 'unreachable' | 'empty' all mean the mirror itself could
+  // not be read as authoritative this call — none of them licenses treating
+  // a fallback zero as "this employer doesn't sponsor".
+  return { coverage: null, useDb: false, fallbackReason: 'primary_unreachable' };
+}
+
+/**
+ * The message for a fallback ZERO (fleet #3198) — never a bare "no filings
+ * found" when the reason the fallback ran was that the mirror could not be
+ * read. `kind`/`query` name what was being searched (e.g. 'employer',
+ * '"OpenAI OpCo, LLC"').
+ */
+function fallbackZeroMessage(kind: string, query: string, year: number, fallbackReason: MirrorFallbackReason): string {
+  if (fallbackReason === 'primary_unreachable') {
+    return (
+      `Could not read our primary DOL LCA source for this request, and the third-party fallback ` +
+      `(h1bdata.info) found no match for ${kind} "${query}" in ${year}. This is NOT confirmation of zero ` +
+      `filings — it means the primary source was never actually consulted this call. Retry the ` +
+      `request before concluding there were no filings.`
+    );
+  }
+  return (
+    `No certified H-1B LCA filings found via h1bdata.info for ${kind} "${query}" in ${year} ` +
+    `(our primary DOL LCA source does not yet cover fiscal year ${year}). They may not sponsor, may file ` +
+    `under a different legal name, or the third-party site may lag or rename employers — this is a ` +
+    `weaker, third-party signal, not a primary-source-verified zero.`
+  );
 }
 
 interface DbLcaRow {
@@ -870,7 +969,7 @@ async function fetchLcaFromDb(
   supabaseKey: string | undefined,
   params: { em?: string; job?: string; city?: string; year: number },
 ): Promise<LcaRecord[] | null> {
-  const rows = await dbRpc<DbLcaRow>(supabaseUrl, supabaseKey, 'h1b_lca_search', {
+  const result = await dbRpc<DbLcaRow>(supabaseUrl, supabaseKey, 'h1b_lca_search', {
     p_employer: params.em || null,
     p_job_title: params.job || null,
     p_worksite_city: params.city || null,
@@ -878,8 +977,8 @@ async function fetchLcaFromDb(
     p_limit: 20000,
     p_any_status: false,
   });
-  if (rows === null) return null;
-  return rows.map((r) => ({
+  if (!result.ok) return null;
+  return result.data.map((r) => ({
     employer: r.employer_name,
     job_title: r.job_title,
     base_salary: r.base_salary_annual,
@@ -915,7 +1014,7 @@ async function fetchStatsFromDb(
   supabaseKey: string | undefined,
   params: { em?: string; job?: string; city?: string; year: number; topN?: number },
 ): Promise<DbStatsRow | null> {
-  const rows = await dbRpc<DbStatsRow>(supabaseUrl, supabaseKey, 'h1b_lca_stats', {
+  const result = await dbRpc<DbStatsRow>(supabaseUrl, supabaseKey, 'h1b_lca_stats', {
     p_employer: params.em || null,
     p_job_title: params.job || null,
     p_worksite_city: params.city || null,
@@ -923,7 +1022,8 @@ async function fetchStatsFromDb(
     p_any_status: false,
     p_top_n: params.topN ?? 10,
   });
-  return rows?.[0] ?? null;
+  if (!result.ok) return null;
+  return result.data[0] ?? null;
 }
 
 interface DbTopSponsorRow {
@@ -938,12 +1038,13 @@ async function fetchTopSponsorsFromDb(
   supabaseKey: string | undefined,
   params: { job: string; city?: string; year: number; limit: number },
 ): Promise<DbTopSponsorRow[] | null> {
-  return dbRpc<DbTopSponsorRow>(supabaseUrl, supabaseKey, 'h1b_top_sponsors', {
+  const result = await dbRpc<DbTopSponsorRow>(supabaseUrl, supabaseKey, 'h1b_top_sponsors', {
     p_job_title: params.job,
     p_worksite_city: params.city || null,
     p_fiscal_year: params.year,
     p_limit: params.limit,
   });
+  return result.ok ? result.data : null;
 }
 
 // ── h1bdata.info (fallback, used only outside the local mirror's loaded window) ──
@@ -1010,6 +1111,48 @@ function topN(recs: LcaRecord[], key: 'job_title' | 'location' | 'employer', n: 
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([value, count]) => ({ value, count }));
 }
 
+// ── employer-name match grading (fleet #3198, same pattern as
+// issuerNameMatch in sec-form-d #3169 and gradeNameMatch in fac #3193) ──────
+//
+// Both this pack's SQL (`employer_name ILIKE '%' || p_employer || '%'`) and
+// its live-scrape query param are plain substring matches, so a query like
+// "OpenAI" or "OpenAI OpCo, LLC" can legitimately pull back MORE THAN ONE
+// distinct legal employer name (a parent, a subsidiary, an unrelated
+// employer whose name happens to contain the query as a substring). Grading
+// each matched name exact-first, rather than leaving them in raw filing-count
+// order, tells the caller which of the `matched_employers` IS the one they
+// asked for and which are merely name-contains variants — disclosed, not
+// silently blended into one count.
+const EMPLOYER_ENTITY_SUFFIX = /\b(l\s*p|llc|l\s*l\s*c|inc|incorporated|ltd|limited|corp|corporation|co|company|plc|lllp|llp)\b/g;
+export function employerNameKey(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(EMPLOYER_ENTITY_SUFFIX, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+export function gradeEmployerMatch(query: string, candidate: string): 'exact' | 'contains' | 'other' {
+  const q = employerNameKey(query);
+  const c = employerNameKey(candidate);
+  if (!q || !c) return 'other';
+  if (q === c) return 'exact';
+  return ` ${c} `.includes(` ${q} `) ? 'contains' : 'other';
+}
+const EMPLOYER_MATCH_ORDER = { exact: 0, contains: 1, other: 2 } as const;
+/** Ranks {value,count} variants exact-first (stable within a grade), tagging
+ *  each with how it matched the query — the same exact/contains/other shape
+ *  #3169 and #3193 already use for issuer and auditee names. */
+export function rankEmployerVariants(
+  query: string,
+  variants: { value: string; count: number }[],
+): { employer: string; lca_filings: number; name_match: 'exact' | 'contains' | 'other' }[] {
+  return variants
+    .map((v, i) => ({ row: { employer: v.value, lca_filings: v.count, name_match: gradeEmployerMatch(query, v.value) }, i }))
+    .sort((a, b) => EMPLOYER_MATCH_ORDER[a.row.name_match] - EMPLOYER_MATCH_ORDER[b.row.name_match] || a.i - b.i)
+    .map(({ row }) => row);
+}
+
 // ── tools ────────────────────────────────────────────────────────────────
 
 async function employerSponsorship(supabaseUrl: string | undefined, supabaseKey: string | undefined, args: Record<string, unknown>): Promise<unknown> {
@@ -1017,9 +1160,13 @@ async function employerSponsorship(supabaseUrl: string | undefined, supabaseKey:
   if (!employer) return { error: 'user_error', message: 'Pass an employer name, e.g. {"employer": "Google"}.' };
   const year = yearArg(args.year);
 
-  const coverage = await getCoverage(supabaseUrl, supabaseKey);
-  const useDb = yearInCoverage(year, coverage);
-  const stats = useDb ? await fetchStatsFromDb(supabaseUrl, supabaseKey, { em: employer, year, topN: 10 }) : null;
+  const mirror = await resolveMirror(supabaseUrl, supabaseKey, year);
+  let fallbackReason = mirror.fallbackReason;
+  const stats = mirror.useDb ? await fetchStatsFromDb(supabaseUrl, supabaseKey, { em: employer, year, topN: 10 }) : null;
+  // The year was inside the mirror's loaded window, but the query itself
+  // failed mid-flight (both dbRpc attempts) — this is a read failure, not a
+  // legitimate "mirror has nothing here" (fleet #3198).
+  if (mirror.useDb && stats === null) fallbackReason = 'primary_unreachable';
 
   if (stats !== null) {
     // Aggregated server-side over EVERY matching row (migration 223) — never
@@ -1030,7 +1177,7 @@ async function employerSponsorship(supabaseUrl: string | undefined, supabaseKey:
         year,
         sponsors_h1b: false,
         source: 'dol_lca_disclosures',
-        data_as_of: coverage?.data_as_of ?? null,
+        data_as_of: mirror.coverage?.data_as_of ?? null,
         message: `No certified H-1B LCA filings found for an employer matching "${employer}" in ${year}. They may not sponsor, may file under a different legal name, or had no filings that year (try another year).`,
       };
     }
@@ -1039,28 +1186,31 @@ async function employerSponsorship(supabaseUrl: string | undefined, supabaseKey:
       year,
       sponsors_h1b: true,
       source: 'dol_lca_disclosures',
-      data_as_of: coverage?.data_as_of ?? null,
+      data_as_of: mirror.coverage?.data_as_of ?? null,
       lca_filings: stats.lca_filings,
-      matched_employers: stats.top_employers.map((e) => e.value),
+      matched_employers: rankEmployerVariants(employer, stats.top_employers),
       base_salary_usd: { min: stats.min_salary, median: stats.median_salary, average: stats.avg_salary, max: stats.max_salary },
       top_job_titles: stats.top_job_titles,
       top_locations: stats.top_locations,
-      note: `Certified LCA filings ≈ the employer intends to sponsor for these roles; actual visa grants differ. Source: DOL LCA disclosures (federal fiscal year ${year}, Oct-Sep). Aggregated over every matching filing, not a truncated sample.`,
+      note: `Certified LCA filings ≈ the employer intends to sponsor for these roles; actual visa grants differ. Source: DOL LCA disclosures (federal fiscal year ${year}, Oct-Sep). Aggregated over every matching filing, not a truncated sample. matched_employers is ranked exact-match first, then name-contains variants.`,
     };
   }
 
   // Fallback: local mirror unavailable (year outside its loaded window, DB
   // unreachable, or migration 223 not yet applied) — live scrape, unchanged
-  // from pre-#2514 behavior (including its own 20,000-row cap).
+  // from pre-#2514 behavior (including its own 20,000-row cap), but a ZERO
+  // from it is never presented as fact when the reason we're here is that
+  // the authoritative mirror could not be read (fleet #3198).
   const finalRecs = await fetchLcaLive({ em: employer, year });
   if (finalRecs.length === 0) {
     return {
       employer,
       year,
-      sponsors_h1b: false,
-      source: 'h1bdata.info (live)',
+      sponsors_h1b: fallbackReason === 'primary_unreachable' ? null : false,
+      source: fallbackReason === 'primary_unreachable' ? 'h1bdata.info (live) — primary source unavailable, unverified' : 'h1bdata.info (live)',
       data_as_of: null,
-      message: `No certified H-1B LCA filings found for an employer matching "${employer}" in ${year}. They may not sponsor, may file under a different legal name, or had no filings that year (try another year).`,
+      source_status: fallbackReason,
+      message: fallbackZeroMessage('employer', employer, year, fallbackReason ?? 'out_of_window'),
     };
   }
   const liveStats = salaryStats(finalRecs);
@@ -1070,12 +1220,13 @@ async function employerSponsorship(supabaseUrl: string | undefined, supabaseKey:
     sponsors_h1b: true,
     source: 'h1bdata.info (live)',
     data_as_of: null,
+    source_status: fallbackReason,
     lca_filings: finalRecs.length,
-    matched_employers: topN(finalRecs, 'employer', 5).map((e) => e.value),
+    matched_employers: rankEmployerVariants(employer, topN(finalRecs, 'employer', 5)),
     base_salary_usd: { min: liveStats.min, median: liveStats.median, average: liveStats.average, max: liveStats.max },
     top_job_titles: topN(finalRecs, 'job_title', 10),
     top_locations: topN(finalRecs, 'location', 10),
-    note: `Certified LCA filings ≈ the employer intends to sponsor for these roles; actual visa grants differ. Source: DOL LCA disclosures via h1bdata.info (year ${year}).`,
+    note: `Certified LCA filings ≈ the employer intends to sponsor for these roles; actual visa grants differ. Source: DOL LCA disclosures via h1bdata.info (year ${year})${fallbackReason === 'primary_unreachable' ? ' — our primary DOL LCA source could not be read this call, so this third-party figure is unverified against it' : ''}.`,
   };
 }
 
@@ -1087,14 +1238,15 @@ async function salary(supabaseUrl: string | undefined, supabaseKey: string | und
   const city = typeof args.city === 'string' ? args.city.trim().toUpperCase() : undefined;
   const limit = Math.min(Math.max(Number(args.limit) || 15, 1), 50);
 
-  const coverage = await getCoverage(supabaseUrl, supabaseKey);
-  const useDb = yearInCoverage(year, coverage);
+  const mirror = await resolveMirror(supabaseUrl, supabaseKey, year);
+  let fallbackReason = mirror.fallbackReason;
   // Stats aggregated over EVERY matching row server-side (migration 223) —
   // both employer AND job_title applied together in SQL, unlike the old
   // row-level path this replaces (which fetched by employer alone and
   // filtered job_title client-side, after truncation to whatever the RPC's
   // row cap let through).
-  const stats = useDb ? await fetchStatsFromDb(supabaseUrl, supabaseKey, { em: employer, job, city, year }) : null;
+  const stats = mirror.useDb ? await fetchStatsFromDb(supabaseUrl, supabaseKey, { em: employer, job, city, year }) : null;
+  if (mirror.useDb && stats === null) fallbackReason = 'primary_unreachable';
 
   if (stats !== null) {
     if (stats.lca_filings === 0) {
@@ -1104,7 +1256,7 @@ async function salary(supabaseUrl: string | undefined, supabaseKey: string | und
         employer: employer ?? null,
         city: city ?? null,
         source: 'dol_lca_disclosures',
-        data_as_of: coverage?.data_as_of ?? null,
+        data_as_of: mirror.coverage?.data_as_of ?? null,
         count: 0,
         message: 'No H-1B salary records matched. Try a broader title, a different year, or removing the employer/city filter.',
       };
@@ -1118,7 +1270,7 @@ async function salary(supabaseUrl: string | undefined, supabaseKey: string | und
       employer: employer ?? null,
       city: city ?? null,
       source: 'dol_lca_disclosures',
-      data_as_of: coverage?.data_as_of ?? null,
+      data_as_of: mirror.coverage?.data_as_of ?? null,
       base_salary_usd: { count: stats.with_salary, min: stats.min_salary, median: stats.median_salary, average: stats.avg_salary, max: stats.max_salary },
       sample: sampleRecs.slice(0, limit).map((r) => ({ employer: r.employer, title: r.job_title, base_salary: r.base_salary, location: r.location, start_date: r.start_date })),
       note: `Real disclosed base salaries from DOL LCA filings (federal fiscal year ${year}) — a market wage benchmark. Aggregated over every matching filing (${stats.lca_filings} total), not a truncated sample.`,
@@ -1126,7 +1278,8 @@ async function salary(supabaseUrl: string | undefined, supabaseKey: string | und
   }
 
   // Fallback: local mirror unavailable — live scrape, unchanged from
-  // pre-#2514 behavior.
+  // pre-#2514 behavior, but a ZERO from it is never presented as fact when
+  // the mirror itself could not be read (fleet #3198).
   const recs = (await fetchLcaLive({ em: employer, job: employer ? undefined : job, city, year })).filter((r) =>
     r.job_title.toLowerCase().includes(job.toLowerCase()),
   );
@@ -1137,10 +1290,11 @@ async function salary(supabaseUrl: string | undefined, supabaseKey: string | und
       year,
       employer: employer ?? null,
       city: city ?? null,
-      source: 'h1bdata.info (live)',
+      source: fallbackReason === 'primary_unreachable' ? 'h1bdata.info (live) — primary source unavailable, unverified' : 'h1bdata.info (live)',
       data_as_of: null,
+      source_status: fallbackReason,
       count: 0,
-      message: 'No H-1B salary records matched. Try a broader title, a different year, or removing the employer/city filter.',
+      message: fallbackZeroMessage('job_title', job, year, fallbackReason ?? 'out_of_window'),
     };
   }
   const liveStats = salaryStats(recs);
@@ -1151,9 +1305,10 @@ async function salary(supabaseUrl: string | undefined, supabaseKey: string | und
     city: city ?? null,
     source: 'h1bdata.info (live)',
     data_as_of: null,
+    source_status: fallbackReason,
     base_salary_usd: { count: liveStats.with_salary, min: liveStats.min, median: liveStats.median, average: liveStats.average, max: liveStats.max },
     sample: recs.slice(0, limit).map((r) => ({ employer: r.employer, title: r.job_title, base_salary: r.base_salary, location: r.location, start_date: r.start_date })),
-    note: `Real disclosed base salaries from DOL H-1B LCA filings — a market wage benchmark. Source: h1bdata.info (year ${year}).`,
+    note: `Real disclosed base salaries from DOL H-1B LCA filings — a market wage benchmark. Source: h1bdata.info (year ${year})${fallbackReason === 'primary_unreachable' ? ' — our primary DOL LCA source could not be read this call, so this third-party figure is unverified against it' : ''}.`,
   };
 }
 
@@ -1164,10 +1319,10 @@ async function topSponsors(supabaseUrl: string | undefined, supabaseKey: string 
   const city = typeof args.city === 'string' ? args.city.trim().toUpperCase() : undefined;
   const limit = Math.min(Math.max(Number(args.limit) || 15, 1), 50);
 
-  const coverage = await getCoverage(supabaseUrl, supabaseKey);
-  const useDb = yearInCoverage(year, coverage);
+  const mirror = await resolveMirror(supabaseUrl, supabaseKey, year);
+  let fallbackReason = mirror.fallbackReason;
 
-  if (useDb) {
+  if (mirror.useDb) {
     const dbSponsors = await fetchTopSponsorsFromDb(supabaseUrl, supabaseKey, { job, city, year, limit });
     if (dbSponsors !== null) {
       if (dbSponsors.length === 0) {
@@ -1176,7 +1331,7 @@ async function topSponsors(supabaseUrl: string | undefined, supabaseKey: string 
           year,
           city: city ?? null,
           source: 'dol_lca_disclosures',
-          data_as_of: coverage?.data_as_of ?? null,
+          data_as_of: mirror.coverage?.data_as_of ?? null,
           count: 0,
           message: 'No H-1B sponsors matched. Try a broader title, a different year, or removing the city filter.',
         };
@@ -1186,18 +1341,32 @@ async function topSponsors(supabaseUrl: string | undefined, supabaseKey: string 
         year,
         city: city ?? null,
         source: 'dol_lca_disclosures',
-        data_as_of: coverage?.data_as_of ?? null,
+        data_as_of: mirror.coverage?.data_as_of ?? null,
         total_filings: dbSponsors[0].total_all_filings,
         top_sponsors: dbSponsors.map((s) => ({ employer: s.employer_name, lca_filings: s.lca_filings, median_base_salary: s.median_base_salary })),
         note: `Employers ranked by certified H-1B LCA filings for this role — a sourcing/target-account signal. Source: DOL LCA disclosures (federal fiscal year ${year}). Ranked over ALL matching filings, not a truncated sample.`,
       };
     }
+    // Year was in the mirror's window but the query itself failed both
+    // attempts — a read failure, not "the mirror has nothing" (fleet #3198).
+    fallbackReason = 'primary_unreachable';
   }
 
-  // Fallback: live scrape, grouped client-side (unchanged from pre-#2514 behavior).
+  // Fallback: live scrape, grouped client-side (unchanged from pre-#2514
+  // behavior), but a ZERO is never presented as fact when the reason we're
+  // here is that the authoritative mirror could not be read.
   const recs = (await fetchLcaLive({ job, city, year })).filter((r) => r.job_title.toLowerCase().includes(job.toLowerCase()));
   if (recs.length === 0) {
-    return { job_title: job, year, city: city ?? null, source: 'h1bdata.info (live)', count: 0, message: 'No H-1B sponsors matched. Try a broader title, a different year, or removing the city filter.' };
+    return {
+      job_title: job,
+      year,
+      city: city ?? null,
+      source: fallbackReason === 'primary_unreachable' ? 'h1bdata.info (live) — primary source unavailable, unverified' : 'h1bdata.info (live)',
+      data_as_of: null,
+      source_status: fallbackReason,
+      count: 0,
+      message: fallbackZeroMessage('job_title', job, year, fallbackReason ?? 'out_of_window'),
+    };
   }
   const byEmployer = new Map<string, number[]>();
   for (const r of recs) {
@@ -1219,9 +1388,11 @@ async function topSponsors(supabaseUrl: string | undefined, supabaseKey: string 
     year,
     city: city ?? null,
     source: 'h1bdata.info (live)',
+    data_as_of: null,
+    source_status: fallbackReason,
     total_filings: recs.length,
     top_sponsors: sponsors,
-    note: `Employers ranked by certified H-1B LCA filings for this role — a sourcing/target-account signal. Source: DOL LCA disclosures via h1bdata.info (year ${year}; total_filings is capped at 20,000 raw rows).`,
+    note: `Employers ranked by certified H-1B LCA filings for this role — a sourcing/target-account signal. Source: DOL LCA disclosures via h1bdata.info (year ${year}; total_filings is capped at 20,000 raw rows)${fallbackReason === 'primary_unreachable' ? ' — our primary DOL LCA source could not be read this call, so this third-party figure is unverified against it' : ''}.`,
   };
 }
 
